@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "sabbir.bt-sub",
+  "name": "BT Sub",
+  "version": "1.0.0",
+  "author": "sabbir",
+  "description": "Use a Bluetooth speaker as a subwoofer: crossover, delay sync with your mic, and a bar panel for volume, bass, delay and crossover.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BtSub.qml"
+  },
+  "barWidget": {
+    "displayName": "BT Sub",
+    "description": "Bluetooth subwoofer: panel with volume, bass, delay and crossover; right-click toggles",
+    "category": "Audio",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "aliases": [
+      "subwoofer",
+      "bluetooth speaker",
+      "bass"
+    ]
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/thesabbir/omarchy-bt-sub"
+}

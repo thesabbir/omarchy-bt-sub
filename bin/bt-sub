@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# Use a Bluetooth speaker as a subwoofer.
+#
+#   bt-sub on|off|toggle|status
+#   bt-sub delay [SECONDS|+STEP|-STEP]   show or tune main-speaker delay (live)
+#   bt-sub crossover [HZ]                show or set sub low-pass frequency (live)
+#   bt-sub calibrate                     measure BT delay with the mic and apply it
+#
+# On: starts a PipeWire filter-chain (as user unit "bt-sub") that exposes a
+# "Speakers + BT Sub" sink. The main speakers get the full signal delayed to
+# line up with Bluetooth latency; the BT speaker gets a mono low-passed mix.
+# The BT speaker's own volume is the subwoofer level.
+#
+# Optional: touch ~/.local/state/bt-sub/autosync to re-run calibrate quietly a
+# few times after "on" while music plays (Bluetooth latency settles over minutes).
+#
+# Env: BT_SUB_MAIN (main speakers sink), BT_SUB_TARGET (BT sink), BT_SUB_MIC.
+
+set -euo pipefail
+
+SELF=$(realpath "$0")
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bt-sub"
+CONF="$STATE_DIR/bt-sub.conf"
+UNIT="bt-sub"
+SINK="bt_sub"
+mkdir -p "$STATE_DIR"
+
+notify() { [[ -n ${BT_SUB_QUIET:-} ]] && return 0; notify-send -a "BT Sub" -i audio-speakers "BT Sub" "$1" 2>/dev/null || true; }
+is_on() { systemctl --user is-active --quiet "$UNIT"; }
+bt_sink() { [[ -n ${BT_SUB_TARGET:-} ]] && { echo "$BT_SUB_TARGET"; return; }; pactl list sinks short | awk '$2 ~ /^bluez_output\./ {print $2; exit}'; }
+get_crossover() { cat "$STATE_DIR/crossover" 2>/dev/null || echo 200; }
+get_delay() { cat "$STATE_DIR/delay" 2>/dev/null || echo 0.120; }
+sink_vol() { pactl get-sink-volume "$1" 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /%$/){print $i+0; exit}}'; }
+sink_exists() { pactl list sinks short | awk -v n="$1" '$2==n{f=1} END{exit !f}'; }
+first_hw_sink() { pactl list sinks short | awk '$2 ~ /^alsa_output\./ {print $2; exit}'; }
+main_sink() {
+  [[ -n ${BT_SUB_MAIN:-} ]] && { echo "$BT_SUB_MAIN"; return; }
+  local m; m=$(cat "$STATE_DIR/main" 2>/dev/null) && sink_exists "$m" && { echo "$m"; return; }
+  first_hw_sink
+}
+# Put the main speakers back at the volume the user was listening at.
+restore_main_vol() { local v; v=$(cat "$STATE_DIR/mainvol" 2>/dev/null) && pactl set-sink-volume "$(main_sink)" "$v%" || true; }
+node_id() { pw-dump Node 2>/dev/null | jq -r --arg n "$1" 'first(.[] | select(.info.props["node.name"] == $n) | .id) // empty'; }
+
+write_conf() {
+  local delay=$1 CROSSOVER
+  CROSSOVER=$(get_crossover)
+  cat >"$CONF" <<EOF
+context.properties = { log.level = 0 }
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+  { name = libpipewire-module-rt flags = [ ifexists nofail ] }
+  { name = libpipewire-module-protocol-native }
+  { name = libpipewire-module-client-node }
+  { name = libpipewire-module-adapter }
+
+  # User-facing sink: delay the mains, mono + 24 dB/oct low-pass for the sub.
+  { name = libpipewire-module-filter-chain
+    args = {
+      node.description = "Speakers + BT Sub"
+      media.name = "Speakers + BT Sub"
+      filter.graph = {
+        nodes = [
+          { type = builtin name = inL label = copy }
+          { type = builtin name = inR label = copy }
+          { type = builtin name = delayL label = delay config = { "max-delay" = 1.0 } control = { "Delay (s)" = $delay } }
+          { type = builtin name = delayR label = delay config = { "max-delay" = 1.0 } control = { "Delay (s)" = $delay } }
+          { type = builtin name = mix label = mixer control = { "Gain 1" = 0.5 "Gain 2" = 0.5 } }
+          { type = builtin name = lp1 label = bq_lowpass control = { "Freq" = $CROSSOVER "Q" = 0.707 } }
+          { type = builtin name = lp2 label = bq_lowpass control = { "Freq" = $CROSSOVER "Q" = 0.707 } }
+          # LR4 low-pass has the phase of a 2nd-order all-pass; give the full-range
+          # mains the same so sub and mains add in phase instead of cancelling.
+          { type = builtin name = apL label = bq_allpass control = { "Freq" = $CROSSOVER "Q" = 0.707 } }
+          { type = builtin name = apR label = bq_allpass control = { "Freq" = $CROSSOVER "Q" = 0.707 } }
+          { type = builtin name = subL label = copy }
+          { type = builtin name = subR label = copy }
+        ]
+        links = [
+          { output = "inL:Out" input = "delayL:In" }
+          { output = "inR:Out" input = "delayR:In" }
+          { output = "delayL:Out" input = "apL:In" }
+          { output = "delayR:Out" input = "apR:In" }
+          { output = "inL:Out" input = "mix:In 1" }
+          { output = "inR:Out" input = "mix:In 2" }
+          { output = "mix:Out" input = "lp1:In" }
+          { output = "lp1:Out" input = "lp2:In" }
+          { output = "lp2:Out" input = "subL:In" }
+          { output = "lp2:Out" input = "subR:In" }
+        ]
+        inputs  = [ "inL:In" "inR:In" ]
+        outputs = [ "apL:Out" "apR:Out" "subL:Out" "subR:Out" ]
+      }
+      capture.props = {
+        node.name = "$SINK"
+        media.class = "Audio/Sink"
+        audio.position = [ FL FR ]
+      }
+      playback.props = {
+        node.name = "btsub_playback"
+        node.passive = true
+        node.autoconnect = false   # linked by hand: FL/FR -> mains, RL/RR -> BT
+        audio.position = [ FL FR RL RR ]
+        stream.dont-remix = true
+      }
+    }
+  }
+]
+EOF
+}
+
+# Wire a 4ch output node to the speakers: FL/FR -> mains, RL/RR -> BT speaker.
+# Idempotent; reruns pick up a reconnected or different Bluetooth speaker.
+link_outputs() {
+  local src=$1 main bt
+  main=$(main_sink); bt=$(bt_sink)
+  pw-link "$src:output_FL" "$main:playback_FL" 2>/dev/null || true
+  pw-link "$src:output_FR" "$main:playback_FR" 2>/dev/null || true
+  if [[ -n $bt ]]; then
+    pw-link "$src:output_RL" "$bt:playback_FL" 2>/dev/null || true
+    pw-link "$src:output_RR" "$bt:playback_FR" 2>/dev/null || true
+  fi
+}
+
+# Unit main process: run the filter-chain and keep its outputs wired.
+# With autosync enabled, re-sync quietly a few times as Bluetooth latency
+# settles — only while something is playing, so music masks the probe.
+AUTOSYNC_AT=(20 90 240 480)   # seconds since start (or since the last miss)
+cmd_run() {
+  pipewire -c "$CONF" &
+  local pid=$! i=0
+  trap 'kill "$pid" 2>/dev/null; wait "$pid"; exit 0' TERM INT
+  SECONDS=0
+  while kill -0 "$pid" 2>/dev/null; do
+    link_outputs btsub_playback
+    if [[ -e $STATE_DIR/autosync ]] && (( i < ${#AUTOSYNC_AT[@]} && SECONDS >= AUTOSYNC_AT[i] )); then
+      if pactl list sinks short | awk -v s="$SINK" '$2==s && $NF=="RUNNING"{f=1} END{exit !f}'; then
+        BT_SUB_QUIET=1 cmd_calibrate >/dev/null 2>&1 || true
+        i=$((i + 1))
+      fi
+    fi
+    sleep 2 & wait $!
+  done
+  wait "$pid"
+}
+
+wait_for_sink() {
+  for _ in $(seq 50); do
+    pactl list sinks short | awk '{print $2}' | grep -qx "$SINK" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+cmd_on() {
+  is_on && { echo "already on"; return 0; }
+  local bt main
+  bt=$(bt_sink)
+  [[ -n $bt ]] || { notify "Connect a Bluetooth speaker first."; echo "no Bluetooth sink" >&2; exit 1; }
+  main=${BT_SUB_MAIN:-$(pactl get-default-sink)}
+  if [[ -z $main || $main == bluez_output.* || $main == "$SINK" ]]; then
+    main=$(main_sink)
+  fi
+  [[ -n $main ]] || { notify "No main speakers found."; exit 1; }
+  echo "$main" >"$STATE_DIR/main"
+  local vol; vol=$(sink_vol "$main"); vol=${vol:-50}
+  echo "$vol" >"$STATE_DIR/mainvol"
+  write_conf "$(get_delay)"
+  systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  systemd-run --user --quiet --collect --unit="$UNIT" \
+    --property=ExecStopPost="$SELF restore-volume" "$SELF" _run
+  if ! wait_for_sink; then
+    systemctl --user stop "$UNIT" 2>/dev/null || true
+    notify "Failed to start (see: journalctl --user -u $UNIT)."
+    exit 1
+  fi
+  # Volume keys now drive "Speakers + BT Sub": move the listening volume there,
+  # run the main speakers at 100%. Restored on off/crash.
+  for _ in $(seq 20); do pw-link -l | grep -q '^btsub_playback:output_RL' && break; sleep 0.1; done
+  link_outputs btsub_playback
+  pactl set-sink-volume "$SINK" "$vol%"
+  pactl set-sink-volume "$main" 100%
+  pactl set-default-sink "$SINK"
+  notify "On — bass to $(pactl list sinks | awk -v n="$bt" '$1=="Name:"&&$2==n{f=1} f&&$1=="Description:"{sub(/^[ \t]*Description: /,"");print;exit}')"
+}
+
+cmd_off() {
+  local main vol
+  main=$(main_sink)
+  if is_on; then
+    vol=$(sink_vol "$SINK"); [[ -n $vol ]] && echo "$vol" >"$STATE_DIR/mainvol"
+    restore_main_vol   # before streams land on the main speakers
+  fi
+  [[ $(pactl get-default-sink) == "$SINK" ]] && pactl set-default-sink "$main" || true
+  systemctl --user stop "$UNIT" 2>/dev/null || true
+  notify "Off"
+}
+
+cmd_delay() {
+  local cur new id
+  cur=$(get_delay)
+  case "${1:-}" in
+    "") echo "$cur"; return ;;
+    [+-]*) new=$(awk -v c="$cur" -v d="$1" 'BEGIN{v=c+d; if(v<0)v=0; if(v>1)v=1; printf "%.3f", v}') ;;
+    *) new=$(awk -v v="$1" 'BEGIN{if(v<0)v=0; if(v>1)v=1; printf "%.3f", v}') ;;
+  esac
+  echo "$new" >"$STATE_DIR/delay"
+  if is_on && id=$(node_id "$SINK") && [[ -n $id ]]; then
+    pw-cli s "$id" Props "{ params = [ \"delayL:Delay (s)\" $new \"delayR:Delay (s)\" $new ] }" >/dev/null
+  fi
+  echo "$new"
+}
+
+cmd_crossover() {
+  local new id
+  [[ -z ${1:-} ]] && { get_crossover; return; }
+  new=$(awk -v v="$1" 'BEGIN{if(v<40)v=40; if(v>250)v=250; printf "%d", v}')
+  echo "$new" >"$STATE_DIR/crossover"
+  if is_on && id=$(node_id "$SINK") && [[ -n $id ]]; then
+    pw-cli s "$id" Props "{ params = [ \"lp1:Freq\" $new \"lp2:Freq\" $new \"apL:Freq\" $new \"apR:Freq\" $new ] }" >/dev/null
+  fi
+  echo "$new"
+}
+
+cmd_calibrate() {
+  is_on || { notify "Turn BT Sub on first."; exit 1; }
+  local mic out main bt py uv
+  main=$(main_sink); bt=$(bt_sink)
+  # numpy from the system python, else a throwaway env via uv.
+  if python3 -c 'import numpy' 2>/dev/null; then
+    py=(python3)
+  elif uv=$(command -v uv || ls "$HOME"/.local/bin/uv "$HOME"/.cargo/bin/uv "$HOME"/.local/share/mise/shims/uv 2>/dev/null | head -1) && [[ -n $uv ]]; then
+    py=("$uv" run -q --no-project --with numpy python3)
+  else
+    notify "Auto-sync needs python-numpy (or uv)."; exit 1
+  fi
+  mic=${BT_SUB_MIC:-$(pactl get-default-source)}
+  local level; level=$(awk -v v="$(sink_vol "$SINK")" 'BEGIN{v=(v==""?50:v)/100; printf "%.5f", v*v*v}')
+  notify "Syncing… (quiet hiss for a few seconds)"
+  if out=$(cd "$STATE_DIR" && "${py[@]}" -I "$(dirname "$SELF")/bt-sub-calibrate.py" "$mic" "$main" "$bt" "$level" 2>"$STATE_DIR/calibrate.log"); then
+    cmd_delay "$out" >/dev/null
+    notify "Synced: delay set to $(awk -v v="$out" 'BEGIN{printf "%d ms", v*1000}')"
+    echo "$out"
+  else
+    notify "Calibration failed: $(tail -1 "$STATE_DIR/calibrate.log")"
+    exit 1
+  fi
+}
+
+case "${1:-toggle}" in
+  on) cmd_on ;;
+  off) cmd_off ;;
+  toggle) if is_on; then cmd_off; else cmd_on; fi ;;
+  status) if is_on; then echo on; elif [[ -n $(bt_sink) ]]; then echo available; else echo unavailable; fi ;;
+  restore-volume) restore_main_vol ;;
+  _run) cmd_run ;;
+  delay) shift; cmd_delay "${1:-}" ;;
+  crossover) shift; cmd_crossover "${1:-}" ;;
+  calibrate) cmd_calibrate ;;
+  *) sed -n '2,18p' "$0"; exit 2 ;;
+esac
